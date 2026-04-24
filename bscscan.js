@@ -66,7 +66,12 @@ function assertValidAddress(addr) {
 }
 
 // Generic GET helper — keeps error handling in one place.
-async function moralisGet(path, params) {
+// Retries on transient errors (5xx, timeouts) with exponential backoff.
+// Moralis free tier sometimes returns HTTP 500 under load instead of a
+// clean 429, so treating 5xx as "try again" is essential.
+const MAX_ATTEMPTS = 3;
+
+async function moralisGet(path, params, attempt = 1) {
   if (!API_KEY) {
     throw new Error('Missing MORALIS_API_KEY in .env');
   }
@@ -81,19 +86,32 @@ async function moralisGet(path, params) {
       timeout: 15_000,
     });
 
-    // Moralis always wraps results in { result: [...] }.
     return Array.isArray(data.result) ? data.result : [];
   } catch (err) {
-    // Surface a clean error message for common cases.
+    const status = err.response?.status;
+    const isTransient =
+      (status && status >= 500) ||       // server-side error
+      err.code === 'ECONNABORTED' ||     // axios timeout
+      err.code === 'ECONNRESET';         // network blip
+
+    if (isTransient && attempt < MAX_ATTEMPTS) {
+      const backoffMs = 1000 * 2 ** attempt; // 2s, then 4s
+      console.warn(
+        `⚠️  Moralis ${status || err.code}; retrying in ${backoffMs}ms ` +
+        `(attempt ${attempt + 1}/${MAX_ATTEMPTS})`
+      );
+      await sleep(backoffMs);
+      return moralisGet(path, params, attempt + 1);
+    }
+
     if (err.response) {
-      const status = err.response.status;
       const msg = err.response.data?.message || err.response.statusText;
       if (status === 401) {
         throw new Error('Moralis 401 Unauthorized — check MORALIS_API_KEY in .env');
       }
       throw new Error(`Moralis HTTP ${status}: ${msg}`);
     }
-    throw err; // timeout, DNS, etc.
+    throw err; // DNS, TLS, etc.
   }
 }
 

@@ -26,7 +26,11 @@ const lastSeenStore = require('./lastSeen');
 const TOKEN          = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID        = process.env.TELEGRAM_CHAT_ID;
 const WALLET         = process.env.WALLET_ADDRESS;
-const POLL_INTERVAL_MS = 30_000; // 30s is well under Moralis free-tier limits.
+// Poll interval defaults to 60s. At 30s we burned through the Moralis
+// free-tier compute-unit budget and got intermittent HTTP 500s. 60s
+// cuts call rate in half with no functional downside for a human-
+// readable notifier. Override via POLL_INTERVAL_SEC in .env if needed.
+const POLL_INTERVAL_MS = (Number(process.env.POLL_INTERVAL_SEC) || 60) * 1000;
 const FETCH_LIMIT      = 20;     // how many recent txs to pull per endpoint each tick.
 
 // Skip transfers Moralis flagged as spam. Override by setting
@@ -117,10 +121,24 @@ function sliceNew(txsNewestFirst, lastSeenHash) {
 
 // One polling cycle: fetch → diff → notify → persist.
 async function tick(state) {
-  const [native, tokens] = await Promise.all([
+  // Promise.allSettled so a BEP-20 hiccup doesn't kill the BNB fetch
+  // (or vice-versa). If one endpoint is down this tick, we still
+  // process whatever the other returned, and we'll retry the failing
+  // one next tick — lastSeen for that type just doesn't advance.
+  const [nativeResult, tokensResult] = await Promise.allSettled([
     getNativeTransactions(WALLET, FETCH_LIMIT),
     getTokenTransactions(WALLET, FETCH_LIMIT),
   ]);
+
+  if (nativeResult.status === 'rejected') {
+    console.warn(`⚠️  BNB fetch failed: ${nativeResult.reason.message}`);
+  }
+  if (tokensResult.status === 'rejected') {
+    console.warn(`⚠️  BEP-20 fetch failed: ${tokensResult.reason.message}`);
+  }
+
+  const native = nativeResult.status === 'fulfilled' ? nativeResult.value : [];
+  const tokens = tokensResult.status === 'fulfilled' ? tokensResult.value : [];
 
   const newNative = sliceNew(native, state.bnb);
   const newTokens = sliceNew(tokens, state.bep20);
