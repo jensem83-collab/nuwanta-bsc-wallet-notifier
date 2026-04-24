@@ -1,0 +1,17 @@
+{
+  "name": "bsc-wallet-notifier",
+  "version": "1.0.0",
+  "description": "Monitor a BSC wallet via BscScan and send Telegram alerts on new transactions.",
+  "main": "index.js",
+  "scripts": {
+    "get-chat-id": "node getChatId.js",
+    "test-telegram": "node testTelegram.js",
+    "test-bsc": "node testBscscan.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}

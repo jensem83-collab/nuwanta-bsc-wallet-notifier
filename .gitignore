@@ -1,0 +1,14 @@
+# Never commit these to git — they contain secrets or runtime state
+node_modules
+.env
+lastSeen.json
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+*.log
+
+# Bundled old state
+*.zip
