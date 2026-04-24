@@ -1,13 +1,14 @@
 // =====================================================================
-// index.js  —  MAIN BOT (Phase 3: poll + notify)
+// index.js  —  MAIN BOT (Phase 6: multi-wallet + USD prices + polish)
 // =====================================================================
 // WHAT THIS DOES
-//   1. On startup: loads lastSeen.json (or initializes it from the
-//      current latest tx, so we don't spam historical transactions).
-//   2. Every POLL_INTERVAL_MS: fetches recent native + BEP-20 txs,
-//      finds ones newer than what we've already seen, and sends each
-//      new one to Telegram. Then updates lastSeen.json.
-//   3. Errors on any single tick are logged — the loop keeps running.
+//   1. Loads a list of wallets from .env (WALLET_ADDRESSES=0x..,0x..).
+//      Optional per-wallet labels via WALLET_LABELS (same order).
+//   2. For each wallet, polls Moralis every POLL_INTERVAL_SEC.
+//      - Detects new BNB + BEP-20 transactions vs lastSeen.json.
+//      - Posts a Telegram alert with amount, USD value (when pricable),
+//        direction, wallet label, time, and a BscScan link.
+//   3. Errors on one wallet/endpoint never affect others.
 //   4. Ctrl+C exits cleanly.
 //
 // RUN WITH:   npm start
@@ -21,66 +22,104 @@ const {
   getTokenTransactions,
 } = require('./bscscan');
 const lastSeenStore = require('./lastSeen');
+const { priceTxUsd } = require('./prices');
 
-// --- Config ----------------------------------------------------------
-const TOKEN          = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID        = process.env.TELEGRAM_CHAT_ID;
-const WALLET         = process.env.WALLET_ADDRESS;
-// Poll interval defaults to 60s. At 30s we burned through the Moralis
-// free-tier compute-unit budget and got intermittent HTTP 500s. 60s
-// cuts call rate in half with no functional downside for a human-
-// readable notifier. Override via POLL_INTERVAL_SEC in .env if needed.
-const POLL_INTERVAL_MS = (Number(process.env.POLL_INTERVAL_SEC) || 60) * 1000;
-const FETCH_LIMIT      = 20;     // how many recent txs to pull per endpoint each tick.
+// --- Small formatting helpers (declared early so config can use them) ---
 
-// Skip transfers Moralis flagged as spam. Override by setting
-// FILTER_SPAM=false in .env if you want to see every airdropped junk token.
-const FILTER_SPAM = (process.env.FILTER_SPAM ?? 'true').toLowerCase() !== 'false';
-
-// --- Startup validation ---------------------------------------------
-// Fail fast with a clear message if .env is incomplete.
-if (!TOKEN)   { console.error('❌ TELEGRAM_BOT_TOKEN missing in .env'); process.exit(1); }
-if (!CHAT_ID) { console.error('❌ TELEGRAM_CHAT_ID missing in .env');   process.exit(1); }
-if (!WALLET)  { console.error('❌ WALLET_ADDRESS missing in .env');     process.exit(1); }
-
-// polling:false — we only SEND messages, never LISTEN. Keeps things simple.
-const bot = new TelegramBot(TOKEN, { polling: false });
-
-// --- Formatting helpers ---------------------------------------------
-
-// Shorten an address/hash for the Telegram message (keeps it readable).
 function short(str) {
   if (!str) return '(unknown)';
   return `${str.slice(0, 6)}...${str.slice(-4)}`;
 }
 
-// Decide if the wallet was the sender or the receiver of this tx.
-function direction(tx) {
-  const me = WALLET.toLowerCase();
-  if (tx.from?.toLowerCase() === me) return '📤 OUT';
-  if (tx.to?.toLowerCase() === me)   return '📥 IN';
-  return '↔️  OTHER';
+// Render a USD number with sensible precision:
+//   >= $1000 → no decimals,  >= $1 → 2 decimals,  < $1 → 4 decimals.
+function fmtUsd(value) {
+  if (value == null || !Number.isFinite(value)) return null;
+  const abs = Math.abs(value);
+  const digits = abs >= 1000 ? 0 : abs >= 1 ? 2 : 4;
+  return `$${value.toLocaleString('en-US', {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })}`;
 }
 
-// Build the Telegram message body for one tx. Markdown formatting.
-function formatTx(tx) {
-  const dir = direction(tx);
-  const isOut = dir === '📤 OUT';
+// --- Config ----------------------------------------------------------
+
+const TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+// Prefer WALLET_ADDRESSES (comma-separated). Fall back to the legacy
+// single WALLET_ADDRESS so old .env files keep working.
+const rawAddresses =
+  process.env.WALLET_ADDRESSES || process.env.WALLET_ADDRESS || '';
+const addresses = rawAddresses
+  .split(',')
+  .map((a) => a.trim().toLowerCase())
+  .filter(Boolean);
+
+// Optional nicknames (positional — match the order of addresses).
+const labels = (process.env.WALLET_LABELS || '').split(',').map((l) => l.trim());
+
+const WALLETS = addresses.map((address, i) => ({
+  address,
+  label: labels[i] || short(address),
+}));
+
+const POLL_INTERVAL_MS = (Number(process.env.POLL_INTERVAL_SEC) || 60) * 1000;
+const FETCH_LIMIT      = 20;
+const FILTER_SPAM = (process.env.FILTER_SPAM ?? 'true').toLowerCase() !== 'false';
+
+// --- Startup validation ---------------------------------------------
+
+if (!TOKEN)   { console.error('❌ TELEGRAM_BOT_TOKEN missing in .env'); process.exit(1); }
+if (!CHAT_ID) { console.error('❌ TELEGRAM_CHAT_ID missing in .env');   process.exit(1); }
+if (WALLETS.length === 0) {
+  console.error('❌ No wallets configured. Set WALLET_ADDRESSES or WALLET_ADDRESS in .env.');
+  process.exit(1);
+}
+for (const w of WALLETS) {
+  if (!/^0x[a-f0-9]{40}$/.test(w.address)) {
+    console.error(`❌ Invalid BSC address: ${w.address}`);
+    process.exit(1);
+  }
+}
+
+// polling:false — we only SEND messages, never LISTEN.
+const bot = new TelegramBot(TOKEN, { polling: false });
+
+// --- Per-tx helpers -------------------------------------------------
+
+function direction(tx, watchAddress) {
+  const me = watchAddress.toLowerCase();
+  if (tx.from?.toLowerCase() === me) return '📤 OUT';
+  if (tx.to?.toLowerCase() === me)   return '📥 IN';
+  return '↔️ OTHER';
+}
+
+// Build the Telegram message body for one tx. Async because it may
+// fetch a USD price (CoinGecko for BNB, hardcoded for stables).
+async function formatTx(tx, wallet) {
+  const dir = direction(tx, wallet.address);
+  const isOut = dir.startsWith('📤');
   const other = isOut ? tx.to : tx.from;
 
-  // Show token name only if it adds info (different from symbol).
+  const usd = await priceTxUsd(tx);
+  const usdStr = fmtUsd(usd);
+  const amountLine = usdStr
+    ? `Amount: *${tx.value}* (~${usdStr})\n`
+    : `Amount: *${tx.value}*\n`;
+
   const nameLine =
     tx.type === 'BEP20' && tx.tokenName && tx.tokenName !== tx.tokenSymbol
       ? `Token: ${tx.tokenName}\n`
       : '';
 
-  // Quiet flag for spam if we ever choose to show it (FILTER_SPAM=false).
   const spamFlag = tx.possibleSpam ? '⚠️ *possible spam*\n' : '';
 
   return (
-    `${dir}  *${tx.type}*\n` +
+    `*${wallet.label}* — ${dir}  *${tx.type}*\n` +
     spamFlag +
-    `Amount: *${tx.value}*\n` +
+    amountLine +
     nameLine +
     `${isOut ? 'To' : 'From'}: \`${short(other)}\`\n` +
     `Time: ${new Date(tx.timestamp).toLocaleString()}\n` +
@@ -101,118 +140,143 @@ async function notify(text) {
   }
 }
 
-// --- Core logic -----------------------------------------------------
+// --- Diff helper ----------------------------------------------------
 
-// Given a list of txs (newest first) and a "last seen" hash, return
-// ONLY the txs that came after that hash — in chronological order
-// (oldest first), so notifications arrive in the right sequence.
+// Given txs (newest first) and a lastSeen hash, return only the txs
+// that came AFTER that hash, in chronological (oldest first) order.
 function sliceNew(txsNewestFirst, lastSeenHash) {
-  if (!lastSeenHash) return []; // no baseline yet; caller handles init.
-
+  if (!lastSeenHash) return [];
   const idx = txsNewestFirst.findIndex((t) => t.hash === lastSeenHash);
-
-  // Not found → either wallet is very busy (>FETCH_LIMIT new txs in one
-  // tick and lastSeen fell off the window) or lastSeen was never in this
-  // list. Safest: treat everything as new to avoid missing anything.
   const newOnes = idx === -1 ? txsNewestFirst : txsNewestFirst.slice(0, idx);
-
-  return newOnes.reverse(); // chronological order for notifying.
+  return newOnes.reverse();
 }
 
-// One polling cycle: fetch → diff → notify → persist.
-async function tick(state) {
-  // Promise.allSettled so a BEP-20 hiccup doesn't kill the BNB fetch
-  // (or vice-versa). If one endpoint is down this tick, we still
-  // process whatever the other returned, and we'll retry the failing
-  // one next tick — lastSeen for that type just doesn't advance.
+// --- One wallet's tick ---------------------------------------------
+
+async function tickOneWallet(wallet, state) {
+  const key = wallet.address;
+  if (!state[key]) state[key] = { bnb: null, bep20: null };
+
   const [nativeResult, tokensResult] = await Promise.allSettled([
-    getNativeTransactions(WALLET, FETCH_LIMIT),
-    getTokenTransactions(WALLET, FETCH_LIMIT),
+    getNativeTransactions(wallet.address, FETCH_LIMIT),
+    getTokenTransactions(wallet.address, FETCH_LIMIT),
   ]);
 
   if (nativeResult.status === 'rejected') {
-    console.warn(`⚠️  BNB fetch failed: ${nativeResult.reason.message}`);
+    console.warn(`⚠️  [${wallet.label}] BNB fetch failed: ${nativeResult.reason.message}`);
   }
   if (tokensResult.status === 'rejected') {
-    console.warn(`⚠️  BEP-20 fetch failed: ${tokensResult.reason.message}`);
+    console.warn(`⚠️  [${wallet.label}] BEP-20 fetch failed: ${tokensResult.reason.message}`);
   }
 
   const native = nativeResult.status === 'fulfilled' ? nativeResult.value : [];
   const tokens = tokensResult.status === 'fulfilled' ? tokensResult.value : [];
 
-  const newNative = sliceNew(native, state.bnb);
-  const newTokens = sliceNew(tokens, state.bep20);
+  const newNative = sliceNew(native, state[key].bnb);
+  const newTokens = sliceNew(tokens, state[key].bep20);
 
-  // Merge + sort chronologically so mixed-type alerts arrive in order.
   let newAll = [...newNative, ...newTokens].sort(
     (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
   );
 
-  // Drop spam transfers (Moralis-flagged) unless FILTER_SPAM=false.
   if (FILTER_SPAM) {
     const before = newAll.length;
     newAll = newAll.filter((tx) => !tx.possibleSpam);
     const skipped = before - newAll.length;
-    if (skipped > 0) console.log(`   (skipped ${skipped} spam transfer(s))`);
+    if (skipped > 0) console.log(`   [${wallet.label}] skipped ${skipped} spam transfer(s)`);
   }
 
   for (const tx of newAll) {
-    console.log(`🔔 New ${tx.type} tx: ${tx.hash}`);
-    await notify(formatTx(tx));
+    console.log(`🔔 [${wallet.label}] new ${tx.type} tx: ${tx.hash}`);
+    await notify(await formatTx(tx, wallet));
   }
 
-  // Advance pointers to the NEWEST item we saw this tick (or keep the
-  // old pointer if there were no txs of that type this tick).
-  if (native.length) state.bnb   = native[0].hash;
-  if (tokens.length) state.bep20 = tokens[0].hash;
+  if (native.length) state[key].bnb   = native[0].hash;
+  if (tokens.length) state[key].bep20 = tokens[0].hash;
 
-  lastSeenStore.save(state);
   return newAll.length;
 }
 
-// --- Main loop ------------------------------------------------------
+// Full tick: loop over every configured wallet sequentially.
+async function tick(state) {
+  let total = 0;
+  for (const wallet of WALLETS) {
+    total += await tickOneWallet(wallet, state);
+  }
+  lastSeenStore.save(state);
+  return total;
+}
+
+// --- Legacy-schema migration ---------------------------------------
+
+// Phase 3 wrote flat state: { bnb, bep20 }.
+// Phase 6 writes nested:    { "0x...": { bnb, bep20 } }.
+// Move the flat keys under the first wallet on first start after upgrade.
+function migrateLegacy(state) {
+  const hasLegacyKeys = state && (state.bnb || state.bep20);
+  const hasNestedKeys = state && WALLETS.some((w) => state[w.address]);
+  if (hasLegacyKeys && !hasNestedKeys && WALLETS.length > 0) {
+    const primary = WALLETS[0].address;
+    console.log(`Migrating legacy lastSeen.json under wallet ${primary}`);
+    return {
+      [primary]: { bnb: state.bnb || null, bep20: state.bep20 || null },
+    };
+  }
+  return state || {};
+}
+
+// --- Main loop -----------------------------------------------------
+
 (async () => {
   console.log('--------------------------------------------------');
-  console.log(' BSC Wallet Notifier — Phase 3');
-  console.log(` Wallet  : ${WALLET}`);
-  console.log(` Poll    : every ${POLL_INTERVAL_MS / 1000}s`);
+  console.log(' BSC Wallet Notifier — Phase 6');
+  console.log(` Wallets : ${WALLETS.length}`);
+  for (const w of WALLETS) console.log(`   - ${w.label}: ${w.address}`);
+  console.log(` Poll    : every ${POLL_INTERVAL_MS / 1000}s per cycle`);
+  console.log(` Spam    : ${FILTER_SPAM ? 'hidden' : 'shown'}`);
   console.log('--------------------------------------------------');
 
-  let state = lastSeenStore.load();
+  let state = migrateLegacy(lastSeenStore.load());
 
-  // First run: initialize lastSeen from the CURRENT latest tx. This
-  // prevents flooding the user with every historical tx on first start.
-  if (!state.bnb || !state.bep20) {
-    console.log('First run detected — initializing lastSeen from current chain state.');
-    try {
-      const [native, tokens] = await Promise.all([
-        getNativeTransactions(WALLET, 1),
-        getTokenTransactions(WALLET, 1),
-      ]);
-      state = {
-        bnb:   native[0]?.hash   || null,
-        bep20: tokens[0]?.hash   || null,
-      };
-      lastSeenStore.save(state);
-      console.log('Initialized:', state);
-    } catch (err) {
-      console.error('❌ Failed to initialize lastSeen:', err.message);
-      process.exit(1);
+  // Per-wallet first-run init: grab the current latest tx so we don't
+  // flood the group with historical activity.
+  for (const wallet of WALLETS) {
+    const key = wallet.address;
+    if (!state[key] || !state[key].bnb || !state[key].bep20) {
+      console.log(`Initializing lastSeen for ${wallet.label} (${wallet.address})`);
+      try {
+        const [native, tokens] = await Promise.all([
+          getNativeTransactions(wallet.address, 1),
+          getTokenTransactions(wallet.address, 1),
+        ]);
+        state[key] = {
+          bnb:   native[0]?.hash   || null,
+          bep20: tokens[0]?.hash   || null,
+        };
+        console.log(`  Initialized: ${JSON.stringify(state[key])}`);
+      } catch (err) {
+        console.error(`❌ Failed to initialize ${wallet.label}:`, err.message);
+        process.exit(1);
+      }
     }
   }
+  lastSeenStore.save(state);
 
+  const walletsList = WALLETS.map((w) => `\`${w.label}\``).join(', ');
   await notify(
-    `🤖 *BSC Notifier online*\nWatching \`${short(WALLET)}\`\nPolling every ${POLL_INTERVAL_MS / 1000}s.`
+    `🤖 *BSC Notifier online*\n` +
+    `Watching ${WALLETS.length} wallet(s): ${walletsList}\n` +
+    `Poll: every ${POLL_INTERVAL_MS / 1000}s.`
   );
 
-  // The loop itself: run a tick, wait, repeat. Errors inside tick()
-  // don't break the schedule — we just log and try again next time.
+  // Tick-sleep-tick forever. Errors inside tick() are caught so the
+  // schedule keeps running.
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
       const n = await tick(state);
       const stamp = new Date().toLocaleTimeString();
-      console.log(`[${stamp}] tick complete — ${n} new tx(s).`);
+      console.log(`[${stamp}] tick complete — ${n} new tx(s) across ${WALLETS.length} wallet(s).`);
     } catch (err) {
       console.error('⚠️  Tick failed:', err.message);
     }
