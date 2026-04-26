@@ -33,8 +33,13 @@ function load() {
 }
 
 function save(state) {
-  // Pretty-print so a human can open it and sanity-check.
-  fs.writeFileSync(FILE_PATH, JSON.stringify(state, null, 2), 'utf8');
+  // Atomic write: write to a sibling tmp file first, then rename. If
+  // the process is killed mid-write, we either get the previous file
+  // intact (rename never happened) or the new file complete (rename
+  // is atomic on the same filesystem). No half-written JSON.
+  const tmp = FILE_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  fs.renameSync(tmp, FILE_PATH);
 }
 
 module.exports = { load, save, FILE_PATH };

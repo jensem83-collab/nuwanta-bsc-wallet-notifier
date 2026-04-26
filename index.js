@@ -31,6 +31,14 @@ function short(str) {
   return `${str.slice(0, 6)}...${str.slice(-4)}`;
 }
 
+// Escape Telegram "Markdown" reserved chars in user-provided strings
+// (wallet labels, token names) so they can't accidentally trigger
+// formatting or break the parser entirely. The four chars Telegram's
+// legacy Markdown mode treats as special: _ * ` [
+function mdEscape(s) {
+  return String(s ?? '').replace(/[_*`\[]/g, '\\$&');
+}
+
 // Render a USD number with sensible precision:
 //   >= $1000 → no decimals,  >= $1 → 2 decimals,  < $1 → 4 decimals.
 function fmtUsd(value) {
@@ -89,18 +97,20 @@ const bot = new TelegramBot(TOKEN, { polling: false });
 
 // --- Per-tx helpers -------------------------------------------------
 
+// Returns { kind, icon } so callers can branch on `kind` (stable enum)
+// while UI uses `icon` (decorative). Keeps display and logic decoupled.
 function direction(tx, watchAddress) {
   const me = watchAddress.toLowerCase();
-  if (tx.from?.toLowerCase() === me) return '📤 OUT';
-  if (tx.to?.toLowerCase() === me)   return '📥 IN';
-  return '↔️ OTHER';
+  if (tx.from?.toLowerCase() === me) return { kind: 'OUT',   icon: '📤' };
+  if (tx.to?.toLowerCase()   === me) return { kind: 'IN',    icon: '📥' };
+  return                              { kind: 'OTHER', icon: '↔️' };
 }
 
 // Build the Telegram message body for one tx. Async because it may
 // fetch a USD price (CoinGecko for BNB, hardcoded for stables).
 async function formatTx(tx, wallet) {
   const dir = direction(tx, wallet.address);
-  const isOut = dir.startsWith('📤');
+  const isOut = dir.kind === 'OUT';
   const other = isOut ? tx.to : tx.from;
 
   const usd = await priceTxUsd(tx);
@@ -111,13 +121,13 @@ async function formatTx(tx, wallet) {
 
   const nameLine =
     tx.type === 'BEP20' && tx.tokenName && tx.tokenName !== tx.tokenSymbol
-      ? `Token: ${tx.tokenName}\n`
+      ? `Token: ${mdEscape(tx.tokenName)}\n`
       : '';
 
   const spamFlag = tx.possibleSpam ? '⚠️ *possible spam*\n' : '';
 
   return (
-    `*${wallet.label}* — ${dir}  *${tx.type}*\n` +
+    `*${mdEscape(wallet.label)}* — ${dir.icon} ${dir.kind}  *${tx.type}*\n` +
     spamFlag +
     amountLine +
     nameLine +
@@ -240,29 +250,51 @@ function migrateLegacy(state) {
 
   // Per-wallet first-run init: grab the current latest tx so we don't
   // flood the group with historical activity.
+  //
+  // We do NOT process.exit on init failure — that would put pm2 in a
+  // tight restart loop during a Moralis outage. Instead we initialize
+  // only the endpoints that aren't already seeded, leave failures as
+  // null, and let the normal tick path retry next cycle. (sliceNew
+  // returns [] for a null lastSeen, so no historical flood when it
+  // recovers.)
   for (const wallet of WALLETS) {
     const key = wallet.address;
-    if (!state[key] || !state[key].bnb || !state[key].bep20) {
-      console.log(`Initializing lastSeen for ${wallet.label} (${wallet.address})`);
-      try {
-        const [native, tokens] = await Promise.all([
-          getNativeTransactions(wallet.address, 1),
-          getTokenTransactions(wallet.address, 1),
-        ]);
-        state[key] = {
-          bnb:   native[0]?.hash   || null,
-          bep20: tokens[0]?.hash   || null,
-        };
-        console.log(`  Initialized: ${JSON.stringify(state[key])}`);
-      } catch (err) {
-        console.error(`❌ Failed to initialize ${wallet.label}:`, err.message);
-        process.exit(1);
+    if (!state[key]) state[key] = { bnb: null, bep20: null };
+
+    const needsBnb   = !state[key].bnb;
+    const needsBep20 = !state[key].bep20;
+    if (!needsBnb && !needsBep20) continue;
+
+    console.log(`Initializing lastSeen for ${wallet.label} (${wallet.address})`);
+
+    const [nativeRes, tokensRes] = await Promise.allSettled([
+      needsBnb   ? getNativeTransactions(wallet.address, 1) : Promise.resolve(null),
+      needsBep20 ? getTokenTransactions(wallet.address, 1)  : Promise.resolve(null),
+    ]);
+
+    if (needsBnb) {
+      if (nativeRes.status === 'fulfilled') {
+        state[key].bnb = nativeRes.value[0]?.hash || null;
+      } else {
+        console.warn(
+          `⚠️  ${wallet.label} BNB init failed: ${nativeRes.reason.message} — will retry next tick`
+        );
       }
     }
+    if (needsBep20) {
+      if (tokensRes.status === 'fulfilled') {
+        state[key].bep20 = tokensRes.value[0]?.hash || null;
+      } else {
+        console.warn(
+          `⚠️  ${wallet.label} BEP-20 init failed: ${tokensRes.reason.message} — will retry next tick`
+        );
+      }
+    }
+    console.log(`  Initialized: ${JSON.stringify(state[key])}`);
   }
   lastSeenStore.save(state);
 
-  const walletsList = WALLETS.map((w) => `\`${w.label}\``).join(', ');
+  const walletsList = WALLETS.map((w) => `\`${mdEscape(w.label)}\``).join(', ');
   await notify(
     `🤖 *BSC Notifier online*\n` +
     `Watching ${WALLETS.length} wallet(s): ${walletsList}\n` +
@@ -285,7 +317,11 @@ function migrateLegacy(state) {
 })();
 
 // --- Graceful shutdown ---------------------------------------------
-process.on('SIGINT', () => {
-  console.log('\n👋 Shutting down (Ctrl+C).');
+// SIGINT  → Ctrl+C and pm2's default stop signal
+// SIGTERM → systemd / OS shutdown / container stop
+function shutdown(reason) {
+  console.log(`\n👋 Shutting down (${reason}).`);
   process.exit(0);
-});
+}
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

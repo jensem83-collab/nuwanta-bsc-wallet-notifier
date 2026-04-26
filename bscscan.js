@@ -22,7 +22,13 @@ require('dotenv').config();
 const axios = require('axios');
 
 const API_KEY = process.env.MORALIS_API_KEY;
-const DEFAULT_WALLET = process.env.WALLET_ADDRESS;
+
+// Fall through both env conventions. The legacy single-wallet var wins
+// when set; otherwise we use the first entry of the multi-wallet list.
+// This keeps `npm run test-bsc` working in either configuration.
+const DEFAULT_WALLET =
+  process.env.WALLET_ADDRESS ||
+  (process.env.WALLET_ADDRESSES || '').split(',')[0]?.trim();
 
 const BASE_URL = 'https://deep-index.moralis.io/api/v2.2';
 const CHAIN = 'bsc'; // Moralis chain slug for BNB Smart Chain (mainnet).
@@ -96,9 +102,12 @@ async function moralisGet(path, params, attempt = 1) {
 
     if (isTransient && attempt < MAX_ATTEMPTS) {
       const backoffMs = 1000 * 2 ** attempt; // 2s, then 4s
+      // Reporting "retry X of Y" instead of "attempt X of Y" so the
+      // numbers match the user's mental model: 0 retries on success,
+      // up to (MAX_ATTEMPTS - 1) retries on persistent failure.
       console.warn(
         `⚠️  Moralis ${status || err.code}; retrying in ${backoffMs}ms ` +
-        `(attempt ${attempt + 1}/${MAX_ATTEMPTS})`
+        `(retry ${attempt} of ${MAX_ATTEMPTS - 1})`
       );
       await sleep(backoffMs);
       return moralisGet(path, params, attempt + 1);
@@ -173,6 +182,10 @@ async function getTokenTransactions(address = DEFAULT_WALLET, limit = 10) {
 }
 
 // --- Combined, newest first ----------------------------------------
+// Convenience helper used by `testBscscan.js` for a quick "last N txs"
+// dump. The main loop in index.js does NOT use this — it calls native
+// and token endpoints separately so it can diff each against its own
+// lastSeen pointer independently.
 async function getAllRecentTransactions(address = DEFAULT_WALLET, limit = 5) {
   // Pull a slightly larger window from each endpoint so the merged
   // "top N newest" is accurate even when activity is lopsided.

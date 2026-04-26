@@ -40,9 +40,9 @@ const { getAllRecentTransactions } = require('./bscscan');
   } catch (err) {
     console.error('\n❌ Test failed:', err.message);
     console.error('\nCommon causes:');
-    console.error('  - BSCSCAN_API_KEY missing or wrong in .env');
-    console.error('  - WALLET_ADDRESS missing or malformed in .env');
-    console.error('  - Network blocked or BscScan temporarily down');
+    console.error('  - MORALIS_API_KEY missing or wrong in .env');
+    console.error('  - WALLET_ADDRESS / WALLET_ADDRESSES missing or malformed in .env');
+    console.error('  - Network blocked or Moralis temporarily down');
     process.exit(1);
   }
 })();
