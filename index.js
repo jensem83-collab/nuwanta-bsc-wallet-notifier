@@ -77,6 +77,29 @@ const POLL_INTERVAL_MS = (Number(process.env.POLL_INTERVAL_SEC) || 60) * 1000;
 const FETCH_LIMIT      = 20;
 const FILTER_SPAM = (process.env.FILTER_SPAM ?? 'true').toLowerCase() !== 'false';
 
+// Token allowlist. If set, only BEP-20 transfers whose `contractAddress`
+// matches one of these (case-insensitive) trigger alerts. Drastically
+// reduces noise + CU usage when you only care about specific tokens.
+const TOKEN_CONTRACTS = (process.env.TOKEN_CONTRACTS || '')
+  .split(',')
+  .map((c) => c.trim().toLowerCase())
+  .filter(Boolean);
+
+// Skip the native BNB endpoint entirely. Halves API calls per tick when
+// you don't care about BNB transfers (e.g. you only watch USDT activity).
+const WATCH_BNB = (process.env.WATCH_BNB ?? 'true').toLowerCase() !== 'false';
+
+// When filtering to specific contracts, fetch a wider BEP-20 window so
+// the contracts of interest don't get pushed off by noisy spam tokens
+// in busy wallets. 100 is Moralis's per-call max.
+const BEP20_FETCH_LIMIT = TOKEN_CONTRACTS.length > 0 ? 100 : FETCH_LIMIT;
+
+// Minimum token amount to notify (strictly greater than). 0 = no
+// minimum. Useful for cutting dust-spam alerts (e.g. only show USDT
+// transfers > 1 USDT). Compared against the human-readable amount
+// printed in tx.value, so it works for any token decimal scheme.
+const MIN_TOKEN_AMOUNT = Number(process.env.MIN_TOKEN_AMOUNT) || 0;
+
 // --- Startup validation ---------------------------------------------
 
 if (!TOKEN)   { console.error('❌ TELEGRAM_BOT_TOKEN missing in .env'); process.exit(1); }
@@ -167,12 +190,18 @@ async function tickOneWallet(wallet, state) {
   const key = wallet.address;
   if (!state[key]) state[key] = { bnb: null, bep20: null };
 
-  const [nativeResult, tokensResult] = await Promise.allSettled([
-    getNativeTransactions(wallet.address, FETCH_LIMIT),
-    getTokenTransactions(wallet.address, FETCH_LIMIT),
-  ]);
+  // Build the set of API calls we actually need this tick. Native BNB
+  // is skipped entirely if WATCH_BNB=false — this is the biggest CU
+  // saver when you only care about a single token.
+  const calls = [
+    WATCH_BNB
+      ? getNativeTransactions(wallet.address, FETCH_LIMIT)
+      : Promise.resolve([]),
+    getTokenTransactions(wallet.address, BEP20_FETCH_LIMIT),
+  ];
+  const [nativeResult, tokensResult] = await Promise.allSettled(calls);
 
-  if (nativeResult.status === 'rejected') {
+  if (WATCH_BNB && nativeResult.status === 'rejected') {
     console.warn(`⚠️  [${wallet.label}] BNB fetch failed: ${nativeResult.reason.message}`);
   }
   if (tokensResult.status === 'rejected') {
@@ -180,7 +209,25 @@ async function tickOneWallet(wallet, state) {
   }
 
   const native = nativeResult.status === 'fulfilled' ? nativeResult.value : [];
-  const tokens = tokensResult.status === 'fulfilled' ? tokensResult.value : [];
+  let   tokens = tokensResult.status === 'fulfilled' ? tokensResult.value : [];
+
+  // Allowlist filter — runs BEFORE sliceNew so the lastSeen pointer
+  // is always anchored to a tx we'd actually notify on, not a spam
+  // token's hash that we'd silently drop.
+  if (TOKEN_CONTRACTS.length > 0) {
+    tokens = tokens.filter(
+      (tx) => tx.contractAddress && TOKEN_CONTRACTS.includes(tx.contractAddress.toLowerCase())
+    );
+  }
+
+  // Minimum-amount filter — same order rationale as above (must run
+  // before sliceNew so lastSeen tracks something we'd actually alert).
+  if (MIN_TOKEN_AMOUNT > 0) {
+    tokens = tokens.filter((tx) => {
+      const amount = parseFloat(String(tx.value).split(' ')[0].replace(/,/g, ''));
+      return Number.isFinite(amount) && amount > MIN_TOKEN_AMOUNT;
+    });
+  }
 
   const newNative = sliceNew(native, state[key].bnb);
   const newTokens = sliceNew(tokens, state[key].bep20);
@@ -240,10 +287,20 @@ function migrateLegacy(state) {
 (async () => {
   console.log('--------------------------------------------------');
   console.log(' BSC Wallet Notifier — Phase 6');
-  console.log(` Wallets : ${WALLETS.length}`);
+  console.log(` Wallets   : ${WALLETS.length}`);
   for (const w of WALLETS) console.log(`   - ${w.label}: ${w.address}`);
-  console.log(` Poll    : every ${POLL_INTERVAL_MS / 1000}s per cycle`);
-  console.log(` Spam    : ${FILTER_SPAM ? 'hidden' : 'shown'}`);
+  console.log(` Poll      : every ${POLL_INTERVAL_MS / 1000}s per cycle`);
+  console.log(` Spam      : ${FILTER_SPAM ? 'hidden' : 'shown'}`);
+  console.log(` Watch BNB : ${WATCH_BNB ? 'yes' : 'no'}`);
+  if (TOKEN_CONTRACTS.length > 0) {
+    console.log(` Tokens    : allowlist of ${TOKEN_CONTRACTS.length} contract(s)`);
+    for (const c of TOKEN_CONTRACTS) console.log(`   - ${c}`);
+  } else {
+    console.log(` Tokens    : all BEP-20`);
+  }
+  if (MIN_TOKEN_AMOUNT > 0) {
+    console.log(` Min amount: > ${MIN_TOKEN_AMOUNT} per token`);
+  }
   console.log('--------------------------------------------------');
 
   let state = migrateLegacy(lastSeenStore.load());
@@ -261,15 +318,22 @@ function migrateLegacy(state) {
     const key = wallet.address;
     if (!state[key]) state[key] = { bnb: null, bep20: null };
 
-    const needsBnb   = !state[key].bnb;
+    // Only consider an endpoint "needed" if the user has it enabled.
+    // Otherwise we leave the pointer null and never call that endpoint.
+    const needsBnb   = WATCH_BNB && !state[key].bnb;
     const needsBep20 = !state[key].bep20;
     if (!needsBnb && !needsBep20) continue;
 
     console.log(`Initializing lastSeen for ${wallet.label} (${wallet.address})`);
 
+    // BEP-20 init grabs a wider window when filtering to specific
+    // contracts — same reason as the tick loop (avoid spam-token noise
+    // pushing the contracts of interest off the page).
+    const initBep20Limit = TOKEN_CONTRACTS.length > 0 ? 100 : 1;
+
     const [nativeRes, tokensRes] = await Promise.allSettled([
       needsBnb   ? getNativeTransactions(wallet.address, 1) : Promise.resolve(null),
-      needsBep20 ? getTokenTransactions(wallet.address, 1)  : Promise.resolve(null),
+      needsBep20 ? getTokenTransactions(wallet.address, initBep20Limit) : Promise.resolve(null),
     ]);
 
     if (needsBnb) {
@@ -283,7 +347,23 @@ function migrateLegacy(state) {
     }
     if (needsBep20) {
       if (tokensRes.status === 'fulfilled') {
-        state[key].bep20 = tokensRes.value[0]?.hash || null;
+        // Apply the same filters at init time so the seeded hash
+        // matches a tx we'd actually alert on. Otherwise lastSeen
+        // could anchor to a dropped tx and the next tick would treat
+        // newer-but-still-dropped txs as "new" forever.
+        let initTokens = tokensRes.value || [];
+        if (TOKEN_CONTRACTS.length > 0) {
+          initTokens = initTokens.filter(
+            (tx) => tx.contractAddress && TOKEN_CONTRACTS.includes(tx.contractAddress.toLowerCase())
+          );
+        }
+        if (MIN_TOKEN_AMOUNT > 0) {
+          initTokens = initTokens.filter((tx) => {
+            const amount = parseFloat(String(tx.value).split(' ')[0].replace(/,/g, ''));
+            return Number.isFinite(amount) && amount > MIN_TOKEN_AMOUNT;
+          });
+        }
+        state[key].bep20 = initTokens[0]?.hash || null;
       } else {
         console.warn(
           `⚠️  ${wallet.label} BEP-20 init failed: ${tokensRes.reason.message} — will retry next tick`
